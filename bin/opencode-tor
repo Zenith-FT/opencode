@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# opencode-tor — pilote le proxy Tor d'OpenCode : start/status/rotate/stop/logs/doctor.
+#
+#   opencode-tor start    # tor (si besoin) + proxy, attend qu'ils répondent
+#   opencode-tor status   # état JSON du proxy (/status)
+#   opencode-tor rotate   # nouveau circuit + IP de sortie (/rotate)
+#   opencode-tor stop     # arrêt propre du proxy (SIGTERM, pidfile)
+#   opencode-tor logs [proxy|tor]  # dernières lignes de journal
+#   opencode-tor doctor   # vérifie chaque étage et dit ce qui coince
+#
+# Ports et chemins par variables d'environnement (défauts entre parenthèses) :
+#   TOR_PROXY_PORT (9253), TOR_SOCKS_PORT (9250), TOR_CONTROL_PORT (9251),
+#   TOR_CONTROL_HOST (127.0.0.1), TOR_COOKIE (état/tor/cookie),
+#   TOR_BOOT_TIMEOUT (90), TOR_PROXY_TIMEOUT (15), TOR_SKIP_TOR ("" : tor géré
+#   par vos soins, utile pour les tests), XDG_STATE_HOME.
+# Pas de pkill/pgrep : on ne pilote que le proxy listé dans notre pidfile.
+set -uo pipefail
+
+SHARE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/opencode-tor-rotate"
+TOR_DIR="$STATE_DIR/tor"
+PROXY_PY="$SHARE/proxy/tor-split-proxy.py"
+PIDFILE="$STATE_DIR/proxy.pid"
+LOG="$STATE_DIR/proxy.log"
+TOR_LOG="$STATE_DIR/tor/tor.log"
+
+PROXY_PORT="${TOR_PROXY_PORT:-9253}"
+SOCKS_PORT="${TOR_SOCKS_PORT:-9250}"
+CONTROL_HOST="${TOR_CONTROL_HOST:-127.0.0.1}"
+CONTROL_PORT="${TOR_CONTROL_PORT:-9251}"
+COOKIE="${TOR_COOKIE:-$TOR_DIR/cookie}"
+BOOT_TIMEOUT="${TOR_BOOT_TIMEOUT:-90}"
+PROXY_TIMEOUT="${TOR_PROXY_TIMEOUT:-15}"
+
+msg() { printf '%s\n' "$*"; }
+die() { printf 'erreur : %s\n' "$*" >&2; exit 1; }
+
+# Vivant ? (via /proc : pas besoin de pgrep, absent sur certains systèmes)
+alive() { [ -n "${1:-}" ] && [ "$1" -gt 0 ] 2>/dev/null && [ -d "/proc/$1" ]; }
+
+# Port TCP ouvert ? (bash /dev/tcp, comme l'ancien lanceur)
+port_ouvert() { (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; }
+
+# Attend qu'un port réponde, au plus $3 secondes. Vrai/faux en code retour.
+attend_port() {
+  local i=0
+  while [ "$i" -lt "$3" ]; do port_ouvert "$1" "$2" && return 0; sleep 1; i=$((i + 1)); done
+  return 1
+}
+
+# GET http://127.0.0.1:PROXY_PORT/<chemin>, sans passer par un proxy
+# d'environnement (le proxy lui-même !). Affiche le corps, code retour 0 si 2xx.
+pyget() {
+  PROXY_PORT="$PROXY_PORT" TOR_ROTATE_TOKEN_FILE="${TOR_ROTATE_TOKEN_FILE:-}" \
+    python3 - "$1" <<'PY'
+import json, os, sys, urllib.request
+path = sys.argv[1]
+port = os.environ["PROXY_PORT"]
+req = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+tok_file = os.environ.get("TOR_ROTATE_TOKEN_FILE", "")
+if tok_file:
+    try:
+        with open(tok_file) as f:
+            req.add_header("x-tor-rotate-token", f.read().strip())
+    except OSError as e:
+        print(f"token illisible ({e})", file=sys.stderr)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(req, timeout=8) as res:
+        sys.stdout.write(res.read().decode("utf-8", "replace"))
+except Exception as e:
+    print(f"proxy injoignable : {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+cmd_start() {
+  if [ -f "$PIDFILE" ]; then
+    pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if alive "$pid"; then msg "proxy déjà en cours (PID $pid, :$PROXY_PORT)"; return 0; fi
+    msg "pidfile périmé ($PIDFILE), on le retire"
+    rm -f "$PIDFILE"
+  fi
+  mkdir -p "$STATE_DIR" "$TOR_DIR/data"
+  command -v python3 >/dev/null || die "python3 introuvable"
+  [ -f "$PROXY_PY" ] || die "proxy introuvable : $PROXY_PY"
+
+  if [ -z "${TOR_SKIP_TOR:-}" ]; then
+    command -v tor >/dev/null || die "tor introuvable (installez-le : pkg install tor / apt install tor)"
+    if ! port_ouvert "$CONTROL_HOST" "$CONTROL_PORT"; then
+      msg "démarrage de tor (SOCKS :$SOCKS_PORT, contrôle :$CONTROL_PORT)..."
+      : > "$TOR_LOG"
+      tor --RunAsDaemon 1 \
+          --SocksPort 127.0.0.1:"$SOCKS_PORT" --ControlPort "$CONTROL_HOST":"$CONTROL_PORT" \
+          --CookieAuthentication 1 --CookieAuthFile "$COOKIE" \
+          --DataDirectory "$TOR_DIR/data" --Log "notice file $TOR_LOG" \
+        || die "tor n'a pas démarré (voir $TOR_LOG)"
+      attend_port "$CONTROL_HOST" "$CONTROL_PORT" "$BOOT_TIMEOUT" \
+        || die "tor ne répond pas sur $CONTROL_HOST:$CONTROL_PORT (voir $TOR_LOG)"
+      if grep -q "Bootstrapped 100%" "$TOR_LOG" 2>/dev/null; then
+        msg "tor prêt (bootstrap 100 %)"
+      else
+        msg "attention : bootstrap Tor incomplet, les circuits suivront (voir $TOR_LOG)"
+      fi
+    else
+      msg "tor déjà en écoute sur $CONTROL_HOST:$CONTROL_PORT"
+    fi
+  fi
+
+  msg "démarrage du proxy (:$PROXY_PORT, log $LOG)..."
+  # shellcheck disable=SC2086
+  nohup python3 "$PROXY_PY" \
+      --port "$PROXY_PORT" --socks-port "$SOCKS_PORT" \
+      --control-host "$CONTROL_HOST" --control-port "$CONTROL_PORT" \
+      --cookie "$COOKIE" --pidfile "$PIDFILE" \
+      >>"$LOG" 2>&1 &
+  attend_port 127.0.0.1 "$PROXY_PORT" "$PROXY_TIMEOUT" \
+    || die "proxy non démarré (voir $LOG)"
+  msg "proxy en cours (:$(pyget /status | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pid", "?"))' 2>/dev/null || echo ?), :$PROXY_PORT)"
+}
+
+cmd_stop() {
+  if [ ! -f "$PIDFILE" ]; then msg "proxy pas en cours (pas de $PIDFILE)"; return 0; fi
+  pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if ! alive "$pid"; then msg "proxy pas en cours (pidfile périmé), on le retire"; rm -f "$PIDFILE"; return 0; fi
+  kill -TERM "$pid" 2>/dev/null || die "impossible de signaler le PID $pid"
+  local i=0
+  while alive "$pid" && [ "$i" -lt 10 ]; do sleep 0.5; i=$((i + 1)); done
+  if alive "$pid"; then die "le proxy (PID $pid) ne s'arrête pas, voir $LOG"; fi
+  rm -f "$PIDFILE"
+  msg "proxy arrêté"
+}
+
+cmd_status() { pyget /status | python3 -m json.tool; }
+
+cmd_rotate() {
+  body="$(pyget /rotate)" || { printf '%s\n' "$body" >&2; return 1; }
+  python3 - "$body" <<'PYEOF'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    print("réponse illisible du proxy"); sys.exit(1)
+exit_ip = d.get("exit_ip") or "?"
+source = d.get("exit_ip_source") or "inconnue"
+print(f"epoch={d.get('epoch')}  fermés={d.get('closed')}  newnym={d.get('newnym')}  exit={exit_ip} ({source})")
+PYEOF
+}
+
+cmd_logs() {
+  case "${1:-proxy}" in
+    proxy) f="$LOG" ;;
+    tor) f="$TOR_LOG" ;;
+    *) die "usage : opencode-tor logs [proxy|tor]" ;;
+  esac
+  [ -f "$f" ] || die "pas encore de journal : $f"
+  tail -n 100 "$f"
+}
+
+# doctor : un contrôle par ligne, code retour 1 si au moins un KO.
+cmd_doctor() {
+  local ko=0
+  check() { if eval "$2"; then printf '[ok] %s\n' "$1"; else printf '[KO] %s\n' "$1"; ko=1; fi; }
+  check "python3 présent" "command -v python3 >/dev/null"
+  check "tor présent" "command -v tor >/dev/null"
+  check "proxy installé ($PROXY_PY)" "[ -f '$PROXY_PY' ]"
+  check "état inscriptible ($STATE_DIR)" "mkdir -p '$STATE_DIR' && [ -w '$STATE_DIR' ]"
+  check "tor en écoute ($CONTROL_HOST:$CONTROL_PORT)" "port_ouvert '$CONTROL_HOST' '$CONTROL_PORT'"
+  check "cookie lisible ($COOKIE)" "[ -r '$COOKIE' ]"
+  if [ -f "$PIDFILE" ] && alive "$(cat "$PIDFILE" 2>/dev/null || echo 0)"; then
+    check "proxy en cours (PID $(cat "$PIDFILE"))" true
+  else
+    check "proxy en cours" false
+  fi
+  check "proxy répond (/status)" "pyget /status >/dev/null"
+  check "plugin déclaré (opencode.json[c])" "python3 - '$HOME' <<'PY'
+import json, os, sys
+home = sys.argv[1]
+for name in (\"opencode.json\", \"opencode.jsonc\"):
+    p = os.path.join(home, \".config\", \"opencode\", name)
+    if os.path.exists(p):
+        sys.exit(0 if \"tor-rotate\" in open(p, errors=\"replace\").read() else 1)
+sys.exit(1)
+PY"
+  if [ "$ko" -eq 0 ]; then msg "tout est en ordre"; else msg "voir les lignes [KO] ci-dessus"; fi
+  return "$ko"
+}
+
+case "${1:-help}" in
+  start) shift; cmd_start "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  rotate) shift; cmd_rotate "$@" ;;
+  logs) shift; cmd_logs "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  help | --help | -h) sed -n '2,17p' "$0" ;;
+  *) die "commande inconnue : $1 (start|status|rotate|stop|logs|doctor)" ;;
+esac

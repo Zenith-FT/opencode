@@ -1,0 +1,8 @@
+{
+  "name": "opencode-tor-rotate",
+  "version": "2.1.0",
+  "description": "OpenCode 2.x plugin: rotate the Tor circuit when the opencode provider rate-limits",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js"
+}
