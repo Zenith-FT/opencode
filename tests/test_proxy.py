@@ -113,6 +113,7 @@ class FakeSocks:
         self.usernames = []  # un élément par connexion
         self.targets = []  # (hôte, port) demandés
         self.server = None
+        self.tasks = set()
 
     async def start(self):
         self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
@@ -123,6 +124,9 @@ class FakeSocks:
         return self.server.sockets[0].getsockname()[1]
 
     async def handle(self, r, w):
+        task = asyncio.current_task()
+        self.tasks.add(task)
+        rr = rw = None  # côté « origine », à fermer même en cas d'erreur
         try:
             ver = await r.readexactly(2)
             if ver[0] != 5:
@@ -157,23 +161,47 @@ class FakeSocks:
         except (OSError, asyncio.IncompleteReadError, asyncio.CancelledError):
             pass
         finally:
-            try:
-                w.close()
-            except OSError:
-                pass
+            self.tasks.discard(task)
+            # rr est un StreamReader (pas de close) : fermer les StreamWriter
+            # ferme le transport partagé côté origine.
+            for sock in (rw, w):
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
     async def stop(self):
         self.server.close()
+        for t in list(self.tasks):  # annuler avant wait_closed() (py >= 3.12)
+            t.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.server.wait_closed()
 
 
-class FakeControl:
-    """Port de contrôle Tor : répond 250 OK et note les commandes."""
+FAKE_FP_A = "A" * 40
+FAKE_FP_B = "B" * 40
 
-    def __init__(self, cookie_ok=True):
+
+def canned_ns(fp, ip):
+    return f"r relai{fp[:4]} {fp} DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD 2026-09-30 10:00:00 {ip} 9001 0\ns entry\nw exit\np accept"
+
+
+class FakeControl:
+    """Faux port de contrôle : AUTHENTICATE / SIGNAL / GETINFO / QUIT.
+
+    `getinfo` associe une clé ("stream-status", "circuit-status", "ns/id/...")
+    à son corps multi-lignes. Une clé absente => erreur 552. `delay_getinfo`
+    retarde les réponses GETINFO (test du budget de /rotate).
+    """
+
+    def __init__(self, getinfo=None, delay_getinfo=0.0):
         self.commands = []
+        self.getinfo = dict(getinfo or {})
+        self.delay_getinfo = delay_getinfo
         self.server = None
-        self.cookie_ok = cookie_ok
+        self.tasks = set()
 
     async def start(self):
         self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
@@ -184,16 +212,38 @@ class FakeControl:
         return self.server.sockets[0].getsockname()[1]
 
     async def handle(self, r, w):
+        task = asyncio.current_task()
+        self.tasks.add(task)
         try:
-            data = await asyncio.wait_for(r.read(4096), 5)
-            for line in data.decode("latin1").split("\r\n"):
-                if line:
-                    self.commands.append(line.split(" ")[0].upper())
-            w.write(b"250 OK\r\n" * 4)
+            buf = b""
+            while b"QUIT\r\n" not in buf:
+                chunk = await asyncio.wait_for(r.read(65536), 10)
+                if not chunk:
+                    break
+                buf += chunk
+            for line in buf.decode("latin1").split("\r\n"):
+                if not line:
+                    continue
+                cmd = line.split(" ")[0].upper()
+                self.commands.append(cmd)
+                if cmd == "GETINFO":
+                    key = line[len("GETINFO "):]
+                    if key not in self.getinfo:
+                        w.write(f'552 Unrecognized key "{key}"\r\n'.encode())
+                    else:
+                        if self.delay_getinfo:
+                            await asyncio.sleep(self.delay_getinfo)
+                        body = self.getinfo[key]
+                        w.write(f"250+{key}=\r\n".encode() + body.encode() + b"\r\n.\r\n250 OK\r\n")
+                elif cmd == "QUIT":
+                    w.write(b"250 OK\r\n")
+                else:  # AUTHENTICATE, SIGNAL NEWNYM...
+                    w.write(b"250 OK\r\n")
             await w.drain()
-        except (OSError, asyncio.TimeoutError):
+        except (OSError, asyncio.TimeoutError, asyncio.CancelledError):
             pass
         finally:
+            self.tasks.discard(task)
             try:
                 w.close()
             except OSError:
@@ -201,7 +251,61 @@ class FakeControl:
 
     async def stop(self):
         self.server.close()
+        # Annuler AVANT wait_closed() : Python >= 3.12 attend les tâches de
+        # handler(), sinon une tâche qui dort nous bloquerait (600 s ici).
+        for t in list(self.tasks):
+            t.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.server.wait_closed()
+
+
+class StallServer:
+    """Accepte les connexions TCP et ne répond jamais (test du budget de /rotate)."""
+
+    def __init__(self):
+        self.server = None
+        self.tasks = set()
+
+    async def start(self):
+        self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
+        return self
+
+    @property
+    def port(self):
+        return self.server.sockets[0].getsockname()[1]
+
+    async def handle(self, r, w):
+        task = asyncio.current_task()
+        self.tasks.add(task)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.tasks.discard(task)
+            try:
+                w.close()
+            except OSError:
+                pass
+
+    async def stop(self):
+        self.server.close()
+        # Annuler AVANT wait_closed() : Python >= 3.12 attend les tâches de
+        # handler(), sinon une tâche qui dort nous bloquerait (600 s ici).
+        for t in list(self.tasks):
+            t.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+        await self.server.wait_closed()
+
+
+def canned_stream_status(*lines):
+    return "\n".join(lines)
+
+
+def canned_circuit_status(*lines):
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +365,8 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
 
     async def open_tunnel(self, host="opencode.ai", port=443, read_reply=True):
         r, w = await asyncio.open_connection("127.0.0.1", self.port)
+        # Chaque test ferme ses tunnels (sinon ResourceWarning au ramassage).
+        self.addCleanup(w.close)
         w.write(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
         await w.drain()
         reply = b""
@@ -375,6 +481,66 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn("error", body["newnym"])
         self.assertEqual(body["epoch"], 1)
+
+    async def test_exit_via_control_prioritaire_au_probe(self):
+        """GETINFO stream -> circuit -> ns/id : l'écho externe n'est pas utilisé."""
+        self.control.getinfo.update({
+            "stream-status": canned_stream_status(
+                "7 OLD 0 93.184.216.34:443",
+                "8 SUCCEEDED 0 opencode.ai:443",
+                "9 SUCCEEDED 4 opencode.ai:443",
+            ),
+            "circuit-status": canned_circuit_status(
+                f"4 BUILT ${FAKE_FP_A}=r1,${FAKE_FP_B}=r2 PURPOSE=GENERAL",
+            ),
+            f"ns/id/{FAKE_FP_B}": canned_ns(FAKE_FP_B, "198.51.100.9"),
+        })
+        self.origin.requests.clear()
+        status, body = await self.aget("/rotate")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["exit_ip"], "198.51.100.9")
+        self.assertEqual(body["exit_ip_source"], "control")
+        self.assertEqual(self.origin.requests, [], "aucun écho externe quand le contrôle répond")
+        self.assertEqual((await self.aget("/status"))[1]["exit_ip_source"], "control")
+
+    async def test_exit_repli_probe_quand_pas_de_flux(self):
+        self.control.getinfo.update({"stream-status": ""})
+        status, body = await self.aget("/rotate")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["exit_ip"], "203.0.113.7")
+        self.assertEqual(body["exit_ip_source"], "probe")
+        self.assertTrue(self.origin.requests, "l'écho externe a servi de repli")
+
+    async def test_exit_dernier_relais_malforme_ignore(self):
+        self.control.getinfo.update({
+            "stream-status": "9 SUCCEEDED 4 opencode.ai:443",
+            "circuit-status": "4 BUILT $Z grand n'importe quoi",
+        })
+        status, body = await self.aget("/rotate")
+        self.assertEqual(status, 200)
+        # repli sur l'écho : le circuit malformé ne casse pas /rotate
+        self.assertEqual(body["exit_ip"], "203.0.113.7")
+        self.assertEqual(body["exit_ip_source"], "probe")
+
+    async def test_exit_ip_null_sans_bloquer_rotate(self):
+        """/rotate répond dans le budget même si tout est lent (plafond 3 s)."""
+        self.control.delay_getinfo = 10.0
+        stall = await StallServer().start()
+        self.addAsyncCleanup(stall.stop)
+        self.cfg.socks_port = stall.port
+        self.cfg.exit_ip_timeout = 30.0  # le plafond dur de 3 s s'applique quand même
+        start = asyncio.get_running_loop().time()
+        status, body = await self.aget("/rotate", timeout=15)
+        elapsed = asyncio.get_running_loop().time() - start
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["exit_ip"])
+        self.assertIsNone(body["exit_ip_source"])
+        self.assertLess(elapsed, 8.0, f"/rotate ne doit pas attendre l'IP ({elapsed:.1f}s)")
+        self.assertGreater(elapsed, 2.0, f"le budget de 3 s doit être utilisé ({elapsed:.1f}s)")
+
+    async def test_determine_exit_ip_budget_zero(self):
+        self.cfg.exit_ip_timeout = 0
+        self.assertEqual(await self.proxy.determine_exit_ip(), (None, None))
 
     async def test_exit_ip_desactive(self):
         self.cfg.ip_echo = ""
@@ -578,6 +744,78 @@ class ConfigTests(unittest.TestCase):
         c = tp.parse_args([], env={})
         self.assertEqual(c.socks_username(0), "rot0")
         self.assertEqual(c.socks_username(7), "rot7")
+
+
+class ParserTests(unittest.TestCase):
+    STREAMS = (
+        "1 SUCCEEDED 0 opencode.ai:443\n"
+        "2 NEW 0 opencode.ai:443\n"
+        "3 SUCCEEDED 5 93.184.216.34:443\n"
+        "4 SUCCEEDED 6 zen.opencode.ai:443\n"
+    )
+
+    def test_pick_stream_prefere_le_domaine(self):
+        cid = tp.pick_stream_circuit(self.STREAMS, "opencode.ai", ("opencode.ai",))
+        self.assertEqual(cid, "6", "le flux vers le sous-domaine, le plus récent, gagne")
+
+    def test_pick_stream_ignore_sans_circuit_et_non_succeeded(self):
+        cid = tp.pick_stream_circuit("1 NEW 0 opencode.ai:443\n2 SUCCEEDED 0 x.test:443", "opencode.ai", ("opencode.ai",))
+        self.assertIsNone(cid)
+
+    def test_pick_stream_repli_plus_recent(self):
+        # Tor affiche l'IP résolue : aucun domaine ne correspond, on prend le
+        # flux établi le plus récent (souvent notre propre sonde).
+        cid = tp.pick_stream_circuit(self.STREAMS, "opencode.ai", ("autre.test",))
+        self.assertEqual(cid, "6")
+
+    def test_pick_stream_vide(self):
+        self.assertIsNone(tp.pick_stream_circuit("", "opencode.ai", ("opencode.ai",)))
+        self.assertIsNone(tp.pick_stream_circuit("n'importe quoi\n", "opencode.ai", ("opencode.ai",)))
+
+    def test_circuit_exit_fp(self):
+        body = f"7 BUILT ${FAKE_FP_A}=r1,${FAKE_FP_B}=r2 PURPOSE=GENERAL\n8 BUILT ${FAKE_FP_A}=r1"
+        self.assertEqual(tp.circuit_exit_fp(body, "7"), FAKE_FP_B)
+        self.assertEqual(tp.circuit_exit_fp(body, "8"), FAKE_FP_A)
+        self.assertIsNone(tp.circuit_exit_fp(body, "9"))
+        self.assertIsNone(tp.circuit_exit_fp("7 BUILT pas-un-chemin", "7"))
+        self.assertIsNone(tp.circuit_exit_fp("7 BUILT $TROP-COURT=r1", "7"))
+
+    def test_ns_ip(self):
+        body = canned_ns(FAKE_FP_B, "198.51.100.9")
+        self.assertEqual(tp.ns_ip(body, FAKE_FP_B), "198.51.100.9")
+        self.assertEqual(tp.ns_ip(body, FAKE_FP_B.lower()), "198.51.100.9")
+        self.assertIsNone(tp.ns_ip(body, FAKE_FP_A))
+        self.assertIsNone(tp.ns_ip("pas de ligne r\n", FAKE_FP_B))
+
+
+class ControlGetinfoTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cookie = Path(self.tmp.name) / "cookie"
+        self.cookie.write_bytes(b"\x01\x02cookie")
+
+    def cfg_for(self, control):
+        return tp.Config(control_port=control.port, cookie=self.cookie)
+
+    async def test_getinfo_multiples_cles(self):
+        control = await FakeControl(getinfo={
+            "stream-status": "9 SUCCEEDED 4 opencode.ai:443",
+            "circuit-status": "4 BUILT $%s=r" % FAKE_FP_A,
+        }).start()
+        self.addAsyncCleanup(control.stop)
+        proxy = tp.Proxy(self.cfg_for(control))
+        info = await proxy.control_getinfo("stream-status", "circuit-status")
+        self.assertEqual(info["stream-status"], "9 SUCCEEDED 4 opencode.ai:443")
+        self.assertIn(FAKE_FP_A, info["circuit-status"])
+        self.assertNotIn("ns/id/xyz", info)
+
+    async def test_getinfo_cle_inconnue_absente(self):
+        control = await FakeControl(getinfo={}).start()
+        self.addAsyncCleanup(control.stop)
+        cfg = tp.Config(control_port=control.port, cookie=Path("/inexistant"))
+        proxy = tp.Proxy(self.cfg_for(control))
+        self.assertEqual(await proxy.control_getinfo("stream-status"), {})
 
 
 class HelperTests(unittest.TestCase):

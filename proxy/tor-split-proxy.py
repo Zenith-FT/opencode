@@ -40,6 +40,9 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 VERSION = "2.1.0"
+# /rotate ne doit jamais attendre l'IP de sortie : budget total maxi, en secondes.
+EXIT_IP_BUDGET = 3.0
+FP_RE = re.compile(r"^[0-9A-Fa-f]{40}$")
 IP_RE = re.compile(r"\b(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{0,4}:[0-9a-fA-F:]{2,})\b")
 DEFAULT_IP_ECHO = "http://api.ipify.org"
 OFF_VALUES = {"", "off", "none", "no", "0", "false", "disable", "disabled"}
@@ -65,6 +68,10 @@ def _off(value) -> bool:
     return str(value).strip().lower() in OFF_VALUES
 
 
+class CookieError(OSError):
+    """Le cookie Tor est illisible (Tor pas encore démarré, mauvais chemin...)."""
+
+
 @dataclass
 class Config:
     """Configuration résolue : drapeaux CLI > variables d'environnement > défauts."""
@@ -83,7 +90,7 @@ class Config:
     ip_echo: str = DEFAULT_IP_ECHO
     token_file: Optional[Path] = None
     connect_timeout: float = 15.0
-    exit_ip_timeout: float = 4.0
+    exit_ip_timeout: float = 3.0
 
     @property
     def socks(self) -> tuple:
@@ -116,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ip-echo", help=f"URL d'écho d'IP (défaut {DEFAULT_IP_ECHO}, 'off' pour désactiver)")
     p.add_argument("--token-file", help="secret partagé exigé pour /rotate")
     p.add_argument("--connect-timeout", help="timeout de connexion, secondes (défaut 15)")
-    p.add_argument("--exit-ip-timeout", help="timeout de la lecture d'IP de sortie, secondes (défaut 4)")
+    p.add_argument("--exit-ip-timeout", help="budget maxi de lecture d'IP de sortie, secondes (défaut 3, plafond 3)")
     p.add_argument("--version", action="version", version=f"tor-split-proxy {VERSION}")
     return p
 
@@ -154,7 +161,7 @@ def parse_args(argv=None, env=None) -> Config:
         ip_echo="" if _off(ip_echo) else str(ip_echo).strip(),
         token_file=Path(str(token)) if token else None,
         connect_timeout=_float(pick("connect_timeout", "TOR_PROXY_CONNECT_TIMEOUT", 15.0), 15.0),
-        exit_ip_timeout=_float(pick("exit_ip_timeout", "TOR_PROXY_EXIT_IP_TIMEOUT", 4.0), 4.0),
+        exit_ip_timeout=_float(pick("exit_ip_timeout", "TOR_PROXY_EXIT_IP_TIMEOUT", 3.0), 3.0),
     )
 
 
@@ -173,17 +180,74 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}", flush=True)
 
 
+def pick_stream_circuit(stream_status: str, host: str, domains) -> Optional[str]:
+    """Circuit d'un flux SUCCEEDED vers nos domaines (le plus récent gagne).
+
+    Tor affiche l'IP résolue plutôt que le nom d'hôte pour les flux établis :
+    à défaut de correspondance de domaine, on prend le flux SUCCEEDED le plus
+    récent avec un circuit (c'est en général notre propre sonde).
+    """
+    def targets_domain(target: str) -> bool:
+        h = target.rpartition(":")[0].strip("[]").lower()
+        return h == host.lower() or any(h == d or h.endswith("." + d) for d in domains)
+
+    best = best_id = None
+    newest = newest_id = None
+    for line in stream_status.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[1] != "SUCCEEDED" or parts[2] == "0":
+            continue
+        try:
+            nid = int(parts[0])
+        except ValueError:
+            continue
+        if newest_id is None or nid > newest_id:
+            newest, newest_id = parts[2], nid
+        if targets_domain(parts[3]) and (best_id is None or nid > best_id):
+            best, best_id = parts[2], nid
+    return best if best is not None else newest
+
+
+def circuit_exit_fp(circuit_status: str, circ_id: str) -> Optional[str]:
+    """Empreinte du dernier relais du circuit (le point de sortie)."""
+    for line in circuit_status.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[0] != circ_id:
+            continue
+        hops = [h for h in parts[2].split(",") if h]
+        if not hops:
+            continue
+        fp = hops[-1].lstrip("$").split("=")[0].split("~")[0].upper()
+        if FP_RE.match(fp):
+            return fp
+    return None
+
+
+def ns_ip(ns_body: str, fp: str) -> Optional[str]:
+    """Adresse IP du relais dans `GETINFO ns/id/<empreinte>` (ligne `r ...`)."""
+    for line in ns_body.splitlines():
+        if not line.startswith("r "):
+            continue
+        parts = line.split()
+        # r surnom identité condensé date heure ip orport dirport
+        if len(parts) >= 8 and parts[2].upper() == fp.upper():
+            return parts[6]
+    return None
+
+
 class Proxy:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.epoch = 0
         self.tunnels: dict = {}  # id -> {"client", "remote", "host", "last"}
         self.last_exit_ip: Optional[str] = None
+        self.last_exit_source: Optional[str] = None  # "control" | "probe" | None
         self.started = time.time()
         self.rotations = 0
         self.server: Optional[asyncio.AbstractServer] = None
         self._next_id = 0
         self._sweeper: Optional[asyncio.Task] = None
+        self._handlers: set = set()  # tâches en cours (attendues par wait_closed)
         self._stopping = asyncio.Event()
 
     # --- utilitaires -----------------------------------------------------
@@ -220,51 +284,146 @@ class Proxy:
     async def socks5_connect(self, host: str, port: int):
         user = self.socks_username().encode()
         r, w = await asyncio.wait_for(asyncio.open_connection(*self.cfg.socks), self.cfg.connect_timeout)
-        w.write(b"\x05\x01\x02")  # VERSION, 1 méthode, user/pass
-        await w.drain()
-        if await r.readexactly(2) != b"\x05\x02":
-            w.close()
-            raise OSError("SOCKS: méthode refusée")
-        w.write(b"\x01" + bytes([len(user)]) + user + b"\x01x")  # VER=1, user, pass
-        await w.drain()
-        if await r.readexactly(2) != b"\x01\x00":
-            w.close()
-            raise OSError("SOCKS: login refusé")
-        h = host.encode()
-        w.write(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + port.to_bytes(2, "big"))
-        await w.drain()
-        rep = await r.readexactly(4)
-        if rep[1] != 0:
-            w.close()
-            raise OSError(f"SOCKS: échec (code {rep[1]})")
-        n = {1: 4, 4: 16}.get(rep[3])
-        if n is None:
-            n = (await r.readexactly(1))[0]
-        await r.readexactly(n + 2)  # adresse + port
-        return r, w
+        try:
+            w.write(b"\x05\x01\x02")  # VERSION, 1 méthode, user/pass
+            await w.drain()
+            if await r.readexactly(2) != b"\x05\x02":
+                raise OSError("SOCKS: méthode refusée")
+            w.write(b"\x01" + bytes([len(user)]) + user + b"\x01x")  # VER=1, user, pass
+            await w.drain()
+            if await r.readexactly(2) != b"\x01\x00":
+                raise OSError("SOCKS: login refusé")
+            h = host.encode()
+            w.write(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + port.to_bytes(2, "big"))
+            await w.drain()
+            rep = await r.readexactly(4)
+            if rep[1] != 0:
+                raise OSError(f"SOCKS: échec (code {rep[1]})")
+            n = {1: 4, 4: 16}.get(rep[3])
+            if n is None:
+                n = (await r.readexactly(1))[0]
+            await r.readexactly(n + 2)  # adresse + port
+            return r, w
+        except BaseException:
+            # Toute erreur (refus, timeout, annulation) doit fermer la socket :
+            # sinon elle reste ouverte et ralentit l'arrêt du proxy.
+            with contextlib.suppress(Exception):
+                w.close()
+            raise
 
     # --- contrôle Tor ----------------------------------------------------
 
-    async def newnym(self) -> str:
+    async def control_exchange(self, *commands: str, timeout: float = 5.0) -> str:
+        """Une connexion au port de contrôle : AUTHENTICATE + commandes + QUIT.
+
+        Renvoie le texte brut de la réponse (blocs multi-lignes 250+... inclus).
+        """
         try:
             cookie = self.cfg.cookie.read_bytes().hex()
         except OSError as e:
-            return f"error: cookie illisible ({e})"
+            raise CookieError(f"cookie illisible ({e})") from e
+        r, w = await asyncio.wait_for(
+            asyncio.open_connection(self.cfg.control_host, self.cfg.control_port), timeout
+        )
         try:
-            r, w = await asyncio.wait_for(
-                asyncio.open_connection(self.cfg.control_host, self.cfg.control_port), 5
-            )
-            w.write(f"AUTHENTICATE {cookie}\r\nSIGNAL NEWNYM\r\nQUIT\r\n".encode())
+            w.write(("AUTHENTICATE " + cookie + "\r\n" + "".join(c + "\r\n" for c in commands) + "QUIT\r\n").encode())
             await w.drain()
-            out = await asyncio.wait_for(r.read(), 5)
+            # Le serveur ferme après QUIT : read() se termine alors.
+            return (await asyncio.wait_for(r.read(), timeout)).decode(errors="replace")
+        finally:
             w.close()
-            return "ok" if out.decode(errors="replace").count("250 OK") >= 2 else "refused"
+
+    async def control_getinfo(self, *keys: str, timeout: float = 5.0) -> dict:
+        """GETINFO multiples sur une seule connexion. Renvoie {clé: corps}."""
+        out = await self.control_exchange(*[f"GETINFO {k}" for k in keys], timeout=timeout)
+        result: dict = {}
+        current = None
+        buf: list = []
+        for line in out.split("\r\n"):
+            if line.startswith("250+"):
+                current = line[4:].split("=", 1)[0]
+                buf = []
+            elif line == "." and current is not None:
+                result[current] = "\n".join(buf)
+                current = None
+            elif line == "250 OK" or line.startswith("250 "):
+                if current is not None and buf:
+                    result[current] = "\n".join(buf)
+                current = None
+            elif current is not None:
+                buf.append(line)
+        return result
+
+    async def newnym(self) -> str:
+        try:
+            out = await self.control_exchange("SIGNAL NEWNYM")
+            return "ok" if out.count("250 OK") >= 2 else "refused"
+        except CookieError as e:
+            return f"error: {e}"
         except Exception as e:  # noqa: BLE001 - on ne veut jamais faire tomber /rotate
             return f"error: {e}"
 
-    # --- IP de sortie (best effort) --------------------------------------
+    # --- IP de sortie (best effort, sans bloquer /rotate) -----------------
+
+    async def determine_exit_ip(self) -> tuple:
+        """Rend (ip, source) avec un budget total de EXIT_IP_BUDGET secondes max.
+
+        1. "control" : lecture exacte via le port de contrôle (flux vers un
+           domaine Tor -> circuit -> dernier relais -> son adresse). Local et
+           sans serveur externe.
+        2. "probe" : écho HTTP externe via le nouveau circuit (repli).
+        (None, None) si rien ne répond dans le budget : /rotate répond quand
+        même, l'IP restera "?" dans les journaux.
+        """
+        budget = min(self.cfg.exit_ip_timeout, EXIT_IP_BUDGET)
+        if budget <= 0:
+            return None, None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + budget
+        remaining = lambda: max(0.05, deadline - loop.time())  # noqa: E731
+        try:
+            ip = await asyncio.wait_for(self.exit_ip_via_control(), remaining())
+            if ip:
+                return ip, "control"
+        except Exception as e:  # noqa: BLE001
+            log(f"[exit-ip] port de contrôle indisponible: {e}")
+        try:
+            ip = await asyncio.wait_for(self.fetch_exit_ip(), remaining())
+            if ip:
+                return ip, "probe"
+        except Exception as e:  # noqa: BLE001
+            log(f"[exit-ip] écho indisponible: {e}")
+        return None, None
+
+    async def exit_ip_via_control(self) -> Optional[str]:
+        """IP de sortie lue sur Tor lui-même, sans serveur externe.
+
+        On ouvre un flux TCP vers un domaine routé via Tor (nouvelle identité
+        SOCKS rot<epoch>, donc nouveau circuit), puis on remonte la chaîne :
+        GETINFO stream-status -> circuit du flux -> GETINFO circuit-status ->
+        dernier relais -> GETINFO ns/id/<empreinte> -> son adresse IP.
+        """
+        host = self.cfg.domains[0] if self.cfg.domains else "opencode.ai"
+        try:
+            _r, w = await self.socks5_connect(host, 443)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"flux Tor vers {host}: {e}") from e
+        try:
+            info = await self.control_getinfo("stream-status", "circuit-status")
+            circ_id = pick_stream_circuit(info.get("stream-status", ""), host, self.cfg.domains)
+            if not circ_id:
+                return None
+            fp = circuit_exit_fp(info.get("circuit-status", ""), circ_id)
+            if not fp:
+                return None
+            ns = await self.control_getinfo(f"ns/id/{fp}")
+            return ns_ip(ns.get(f"ns/id/{fp}", ""), fp)
+        finally:
+            with contextlib.suppress(Exception):
+                w.close()
 
     async def fetch_exit_ip(self) -> Optional[str]:
+        """Repli « probe » : écho HTTP externe via le nouveau circuit Tor."""
         if not self.cfg.ip_echo:
             return None
         parts = urlsplit(self.cfg.ip_echo)
@@ -343,12 +502,13 @@ class Proxy:
         self.rotations += 1
         closed = self._close_all_tunnels()
         nym = await self.newnym()
-        exit_ip = await self.fetch_exit_ip()
+        exit_ip, source = await self.determine_exit_ip()
         if exit_ip:
             self.last_exit_ip = exit_ip
+            self.last_exit_source = source
         log(
             f"[rotate] epoch={self.epoch}  tunnels fermés={closed}  newnym={nym}  "
-            f"exit={exit_ip or '?'}"
+            f"exit={exit_ip or '?'} ({source or 'inconnue'})"
         )
         payload.update(
             {
@@ -356,6 +516,7 @@ class Proxy:
                 "closed": closed,
                 "newnym": nym,
                 "exit_ip": exit_ip,
+                "exit_ip_source": source,
                 "tunnels": len(self.tunnels),
             }
         )
@@ -369,6 +530,7 @@ class Proxy:
             "tunnels": len(self.tunnels),
             "domains": list(self.cfg.domains),
             "exit_ip": self.last_exit_ip,
+            "exit_ip_source": self.last_exit_source,
             "socks_port": self.cfg.socks_port,
             "socks_username": self.socks_username(),
             "control_port": self.cfg.control_port,
@@ -406,6 +568,9 @@ class Proxy:
                     dst.write_eof()
 
     async def handle(self, cr, cw) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._handlers.add(task)
         tunnel_id = None
         try:
             try:
@@ -472,6 +637,8 @@ class Proxy:
         finally:
             if tunnel_id is not None:
                 self._close_tunnel(tunnel_id)
+            if task is not None:
+                self._handlers.discard(task)
 
     async def control(self, target: str, headers: dict, cw) -> None:
         path, _, query = target.partition("?")
@@ -539,10 +706,17 @@ class Proxy:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._sweeper
         if self.server:
-            self.server.close()
+            self.server.close()  # plus d'acceptation
+        # Les tunnels d'abord, sinon wait_closed() attendrait leurs pipes
+        # (Python >= 3.12 attend les tâches de handle(), pas juste l'écoute).
+        closed = self._close_all_tunnels()
+        for task in list(self._handlers):
+            task.cancel()
+        if self._handlers:
+            await asyncio.gather(*self._handlers, return_exceptions=True)
+        if self.server:
             with contextlib.suppress(Exception):
                 await self.server.wait_closed()
-        closed = self._close_all_tunnels()
         self.remove_pidfile()
         log(f"[arrêt] tunnels fermés={closed} — bye")
 
