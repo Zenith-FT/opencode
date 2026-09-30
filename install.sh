@@ -68,9 +68,11 @@ run "chmod +x '$SHARE/bin/opencode-tor'"
 
 # 4. État -> ~/.local/state/... (migration de l'ancien dossier) -------------
 if [ -d "$OLD_STATE" ] && [ ! -d "$STATE_DIR" ]; then
-  say "migration de l'état : $OLD_STATE -> $STATE_DIR"
+  # COPIE, pas déplacement : l'ancien dossier reste en place (retour en
+  # arrière possible : il suffit de relancer l'ancien ~/opencode-tor).
+  say "migration de l'état : copie $OLD_STATE -> $STATE_DIR (original conservé)"
   run "mkdir -p '$(dirname "$STATE_DIR")'"
-  run "mv '$OLD_STATE' '$STATE_DIR'"
+  run "cp -a '$OLD_STATE' '$STATE_DIR'"
 elif [ -d "$OLD_STATE" ] && [ -d "$STATE_DIR" ]; then
   say "état : $OLD_STATE et $STATE_DIR coexistent, on ne touche à rien (voir doctor)"
 else

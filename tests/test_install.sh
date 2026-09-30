@@ -86,8 +86,12 @@ fi
 mkdir -p "$HOME/.opencode_check_tor" && echo marqueur > "$HOME/.opencode_check_tor/plugin.log"
 rm -rf "$HOME/.local/state/opencode-tor-rotate"
 bash "$SRC/install.sh" >/dev/null || ko "migration état : code retour"
-[ -f "$HOME/.local/state/opencode-tor-rotate/plugin.log" ] && [ ! -e "$HOME/.opencode_check_tor" ] \
-  && ok "migration état : déplacé" || ko "migration état : déplacé"
+if [ "$(cat "$HOME/.local/state/opencode-tor-rotate/plugin.log" 2>/dev/null)" = "marqueur" ] \
+  && [ -f "$HOME/.opencode_check_tor/plugin.log" ]; then
+  ok "migration état : copié, original conservé"
+else
+  ko "migration état : copié, original conservé"
+fi
 
 # --- 5. --service-env avec --yes --------------------------------------------
 bash "$SRC/install.sh" --service-env --yes >/dev/null || ko "service-env : code retour"

@@ -1,0 +1,35 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning bin/opencode-tor install.sh uninstall.sh tests/test_install.sh
+
+      - name: node --check + tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --check plugin/index.js
+      - run: npm test
+
+      - name: py_compile + unittest
+        run: |
+          python3 -m py_compile proxy/tor-split-proxy.py tests/test_proxy.py
+          python3 -m unittest discover -s tests -p 'test_*.py'
+
+      # Pas de collision de ports : les tests proxy lient le port 0
+      # (éphémère), les tests installateur utilisent 1925x (jamais 925x).
+      - name: JSON (fichiers + fusion réelle en HOME jetable)
+        run: |
+          python3 -m json.tool package.json > /dev/null
+          python3 -m json.tool plugin/package.json > /dev/null
+          bash tests/test_install.sh
