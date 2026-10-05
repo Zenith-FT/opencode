@@ -21,16 +21,23 @@ Pas d'installeur `curl | bash` (rien à exécuter sans l'avoir lu). Options :
 `OUI` explicite — le service doit redémarrer ensuite).
 Voir [docs/config.md](docs/config.md) pour toutes les options.
 
-L'installeur exige **OpenCode V2** (`opencode --version`) : la V1 rejette la
-clé plurielle `plugins`. Il déclare le plugin sous cette forme, sans toucher
-au reste de `opencode.json` (ou `.jsonc`, sauvegarde avant écriture) :
+L'installeur exige **OpenCode V2** (`opencode --version`) : la V1 ne charge pas
+les plugins (clé `plugins` ignorée sans erreur, vérifié en 1.18.34 — la
+déclaration peut donc vivre dans la config globale). Il déclare le plugin sous cette forme (un **tableau**,
+comme l'exige la V2 : la forme objet `{"tor-rotate": {...}}` est ignorée en
+silence), sans toucher au reste de `opencode.json` (ou `.jsonc`, sauvegarde avant
+écriture). Une ancienne forme objet est convertie automatiquement :
 
 ```json
-{ "plugins": { "tor-rotate": {
+{ "plugins": [ {
   "package": "/home/vous/.local/share/opencode-tor-rotate/plugin",
   "options": { "proxyUrl": "http://127.0.0.1:9253" }
-} } }
+} ] }
 ```
+
+**Windows (PowerShell)** : `install.sh` est un script bash. Voir
+[docs/windows.md](docs/windows.md) et `bin/opencode-tor.ps1` (lance tor + proxy,
+puis `opencode2`, depuis une simple commande `opencode2` via votre profil).
 
 ## Usage
 
@@ -43,12 +50,57 @@ opencode-tor logs [proxy|tor]
 opencode-tor doctor   # un contrôle par ligne
 ```
 
-Fonctionnement : après 3 rate limits **d'affilée** du fournisseur `opencode`
-(le compteur repart à zéro dès qu'une requête réussit), le plugin appelle
+Fonctionnement : dès la **deuxième** erreur de quota d'affilée du fournisseur
+`opencode` (429, `FreeUsageLimitError`, « Rate limit exceeded »). La première est
+laissée à OpenCode, car un simple « trop vite » passe en retentant ; réglable avec
+l'option `after` (ex. `1` pour tourner dès la première). Le compteur repart à zéro
+dès qu'une requête réussit. Le plugin appelle
 `/rotate` (nouvelle identité SOCKS `rot<epoch>` → nouveau circuit), attend
-1,5 s et laisse OpenCode retenter. Garde-fou : **5 rotations max par
-10 minutes**, une alerte par fenêtre. L'IP de sortie est lue sur le port de
+1,5 s et laisse OpenCode retenter. Garde-fou : **1 rotation max toutes les
+15 secondes**, une alerte par fenêtre. L'IP de sortie est lue sur le port de
 contrôle Tor (repli : écho externe `probe`) et journalisée avant → après.
+
+## Affichage dans OpenCode (widget)
+
+Le plugin ajoute un indicateur à l'écran, pour savoir **s'il est chargé et ce qu'il fait** :
+
+| Où | Quoi |
+|---|---|
+| Écran d'accueil (`home.footer`) | ligne d'état |
+| Barre du prompt (`prompt.footer.status`) | ligne d'état : `● Tor 185.x.x.x ↻2` |
+| Barre latérale (`sidebar.content`) | panneau : état, IP, rotations `n/max`, erreurs d'affilée, requêtes OK, dernier événement, tunnels |
+| Barre latérale, ligne en plus | **Reset du quota** : heure locale de la remise à zéro (`02:00 UTC+2`) et compte à rebours |
+| Barre latérale, 2 lignes en plus | **Exits Tor disponibles** (nombre d'exits en marche) et **l'IP de sortie est-elle un noeud Tor ?** (oui / relais / NON) |
+| Toasts | plugin actif · quota épuisé · **nouvelle IP A → B** · garde-fou · Tor hors ligne |
+
+États : `● vert` prêt / nouvelle IP · `● jaune` quota épuisé, `◐` rotation en cours ·
+`● rouge` Tor hors ligne, garde-fou atteint · `○ rouge` **plugin non chargé / arrêté**.
+
+Le widget tourne dans le processus TUI ; il lit `plugin.state.json` (écrit par
+le plugin, état dans `~/.local/state/opencode-tor-rotate/`) et interroge le
+proxy en direct (`/status`, toutes les 5 s). Si le widget ne peut pas se
+charger, un toast rouge « widget non chargé » donne la raison. Vérifier :
+`ctrl+p` → **Open plugin manager dialog**, ou `opencode-tor doctor`.
+
+Les deux lignes « exits » viennent d'**Onionoo**, l'API officielle du Tor Project
+(`onionoo.torproject.org`) : 1 requête / 15 min pour le compte, 1 / 30 min par IP de
+sortie. Si l'IP n'est PAS un noeud Tor connu, le widget passe en jaune `● <ip> ⚠ hors Tor`
+(le trafic ne passe sans doute pas par Tor). `onionoo: false` coupe ces contrôles.
+
+**Heure de remise à zéro du quota.** D'après le code public d'OpenCode
+(`zen/util/ipRateLimiter.ts`), le compteur gratuit est **par IP et par jour UTC** et sa
+clé expire à la prochaine minuit UTC : la remise à zéro a lieu à **00:00 UTC**, pour tout
+le monde. Le widget la convertit dans le fuseau de ta machine, heure d'été/hiver comprise
+(Paris : 02:00 en été, 01:00 en hiver). Deux réserves : c'est le code public, non vérifié
+sur le service en production (mes réponses 429 n'avaient pas d'en-tête `retry-after`),
+et la valeur de la limite quotidienne est secrète. **Changer d'IP donne un compteur neuf
+tout de suite** : inutile d'attendre la remise à zéro. À la 1re erreur le pied de page
+affiche `● limite de débit 1/2`, à la 2e `● quota épuisé · reset 02:00`.
+
+Options (`options` de l'entrée `plugins`) : `toasts: false` (pas de toasts),
+`timeZone` (ex. `"Europe/Paris"`, sinon le fuseau du système),
+`pollMs` (rafraîchissement, 500 ms), `stateFile`. Le fichier livré
+`plugin/tui.mjs` est généré depuis `plugin/tui.tsx` (`npm i && npm run build:tui`).
 
 ## Usage responsable
 
@@ -58,8 +110,9 @@ Vérifiez les conditions d'utilisation du fournisseur avant d'utiliser cet
 outil ; en cas de doute, ne l'utilisez pas.
 
 Limites intégrées (ce ne sont pas des excuses, juste des freins) :
-rotations plafonnées (5 / 10 min), 3 erreurs d'affilée exigées, **seul
-`opencode.ai` passe par Tor** (tout le reste en direct). Rien ici ne rend
+rotations plafonnées (**1 / 15 s**, c'est le vrai frein), seuil `after`
+réglable (2 par défaut), détection limitée aux vraies erreurs de quota (un 403, un 500 ou une
+surcharge ne déclenchent rien), **seul `opencode.ai` passe par Tor** (tout le reste en direct). Rien ici ne rend
 quoi que ce soit « illimité ».
 
 ## Migration et retour arrière
@@ -98,15 +151,16 @@ Retour à l'ancien layout (`~/opencode-tor` + `~/.opencode_check_tor`) :
 
 ## Feuille de route
 
-- **Support OpenCode V1** : la V1 rejette la clé `plugins` (singulier
-  `plugin`, forme liste uniquement). Prévu : détection + écriture au bon
+- **Support OpenCode V1** : la V1 ignore la clé `plugins` sans erreur (vérifié
+  en 1.18.34 ; singulier `plugin`, forme liste uniquement). Prévu : détection + écriture au bon
   format selon la version. En attendant, V2 exigée (l'installeur refuse V1).
 - Piste : rotation préventive avant les gros lots de requêtes.
 
 ## Développement
 
 ```bash
-npm test            # plugin (node:test, 29 cas)
+npm test            # plugin + modèle du widget (node:test, 52 cas)
+npm run test:tui    # rendu réel du widget (bun + OpenTUI, 6 cas)
 npm run test:py     # proxy (unittest, 42 cas)
 npm run test:install  # installateur (bash, 24 cas, HOME jetable + faux binaires)
 ```

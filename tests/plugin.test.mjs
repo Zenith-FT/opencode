@@ -11,6 +11,8 @@ import plugin, {
   DEFAULTS,
   createLogger,
   createRotator,
+  createStateWriter,
+  fmtDuration,
   defaultLogFile,
   isRateLimit,
   resolveConfig,
@@ -479,4 +481,144 @@ test("setup + hooks branchés : 3 rate limits déclenchent vraiment une rotation
   assert.deepEqual(c.decision, { retry: true, delay: 42 })
   assert.match(await readLog(logFile), /exit \? -> 5\.5\.5\.5/)
   assert.match(await readLog(logFile), /rotation #1 OK/)
+})
+
+// --- 9. défaut after=1, détection stricte, état pour le widget ---------------
+
+test("défauts : 2 erreurs d'affilée pour tourner, 1 rotation max toutes les 15 s", async () => {
+  assert.deepEqual([DEFAULTS.after, DEFAULTS.maxRotations, DEFAULTS.windowMs], [2, 1, 15_000])
+  let t = 1_000_000
+  const cfg = resolveConfig({ logFile: path.join(tmp(), "plugin.log"), cooldownMs: 0 }, {})
+  const rot = createRotator({ cfg, log: collector(), fetchImpl: fakeProxy({ "/rotate": rotate() }), now: () => t })
+
+  // 1re erreur ("trop vite" ?) : laissée à OpenCode, ni décision ni rotation
+  const e1 = opencodeRetry()
+  await rot.onRetry(e1)
+  assert.equal(e1.decision, undefined)
+  assert.equal(rot.info().rotations, 0)
+
+  // 2e erreur d'affilée : quota épuisé -> rotation + nouvel essai
+  const e2 = opencodeRetry()
+  await rot.onRetry(e2)
+  assert.equal(rot.info().rotations, 1)
+  assert.deepEqual(e2.decision, { retry: true, delay: DEFAULTS.settleMs })
+
+  // deux nouvelles erreurs dans les 15 s : le garde-fou bloque une 2e rotation
+  t += 5_000
+  await rot.onRetry(opencodeRetry())
+  const e4 = opencodeRetry()
+  await rot.onRetry(e4)
+  assert.equal(rot.info().rotations, 1, "pas de 2e rotation avant 15 s")
+  assert.equal(e4.decision, undefined, "on laisse OpenCode gérer")
+
+  // 16 s après la rotation : de nouveau autorisé
+  t += 11_000
+  const e5 = opencodeRetry()
+  await rot.onRetry(e5)
+  assert.equal(rot.info().rotations, 2)
+  assert.deepEqual(e5.decision, { retry: true, delay: DEFAULTS.settleMs })
+})
+
+test("une requête réussie entre deux erreurs remet le compteur à zéro", async () => {
+  const h = rotator({ cooldownMs: 0 })
+  await h.rot.onRetry(opencodeRetry())
+  h.rot.onResponse({ response: { status: 200, url: "https://opencode.ai/zen/v1/chat/completions" } })
+  const e = opencodeRetry()
+  await h.rot.onRetry(e)
+  assert.equal(rotates(h), 0, "l'erreur après un succès est de nouveau une 1re erreur")
+  assert.equal(e.decision, undefined)
+})
+
+test("fmtDuration : secondes sous la minute, minutes au-dessus", () => {
+  assert.equal(fmtDuration(15_000), "15 s")
+  assert.equal(fmtDuration(500), "1 s")
+  assert.equal(fmtDuration(600_000), "10 min")
+  assert.equal(fmtDuration(90_000), "2 min")
+})
+
+test("un 403 FreeTierError (texte 'OpenCode') ne déclenche PAS de rotation", async () => {
+  const h = rotator({ cooldownMs: 0 })
+  const ev = opencodeRetry({
+    error: {
+      status: 403,
+      message: "FreeTierError: OpenCode's free tier can only be used from within OpenCode",
+    },
+  })
+  await h.rot.onRetry(ev)
+  assert.equal(rotates(h), 0)
+  assert.equal(ev.decision, undefined)
+})
+
+test("un 500 ou une surcharge fournisseur ne déclenche PAS de rotation", async () => {
+  const h = rotator({ cooldownMs: 0 })
+  for (const error of [
+    { status: 500, message: "Internal server error" },
+    { status: 529, message: "service_overloaded" },
+    { status: 401, message: "ModelError: Model muse-spark-1.3-free is not supported" },
+  ]) {
+    await h.rot.onRetry(opencodeRetry({ error }))
+  }
+  assert.equal(rotates(h), 0)
+})
+
+test("le message FreeUsageLimitError sans status est reconnu comme quota", async () => {
+  const h = rotator({ cooldownMs: 0, after: 1 })
+  await h.rot.onRetry(opencodeRetry({ error: { message: "FreeUsageLimitError: Rate limit exceeded" } }))
+  assert.equal(rotates(h), 1)
+})
+
+test("états émis pour le widget : ready -> ratelimited -> rotating -> rotated", async () => {
+  const seen = []
+  const cfg = resolveConfig({ logFile: path.join(tmp(), "plugin.log"), cooldownMs: 0, after: 1 }, {})
+  const rot = createRotator({
+    cfg,
+    log: collector(),
+    fetchImpl: fakeProxy({ "/status": { exit_ip: "1.1.1.1", epoch: 0, tunnels: 0 }, "/rotate": rotate(1, { exit_ip: "2.2.2.2" }) }),
+    onState: (s) => seen.push(s),
+  })
+  await rot.checkProxy()
+  await rot.onRetry(opencodeRetry())
+  assert.deepEqual(seen.map((s) => s.state), ["ready", "ratelimited", "rotating", "rotated"])
+  const last = seen.at(-1)
+  assert.equal(last.rotations, 1)
+  assert.equal(last.lastExit, "2.2.2.2")
+  assert.equal(last.proxyOk, true)
+  assert.match(last.message, /1\.1\.1\.1 -> 2\.2\.2\.2/)
+})
+
+test("proxy injoignable => état proxy_down, puis error si la rotation échoue", async () => {
+  const seen = []
+  const cfg = resolveConfig({ logFile: path.join(tmp(), "plugin.log"), cooldownMs: 0, after: 1 }, {})
+  const rot = createRotator({
+    cfg,
+    log: collector(),
+    fetchImpl: fakeProxy({ "/status": { throw: "ECONNREFUSED" }, "/rotate": { throw: "ECONNREFUSED" } }),
+    onState: (s) => seen.push(s),
+  })
+  await rot.checkProxy()
+  assert.equal(seen.at(-1).state, "proxy_down")
+  assert.equal(seen.at(-1).proxyOk, false)
+  await rot.onRetry(opencodeRetry())
+  assert.equal(seen.at(-1).state, "error")
+})
+
+test("garde-fou : l'état 'guard' est publié", async () => {
+  const h = rotator({ cooldownMs: 0, maxRotations: 1, windowMs: 600_000 })
+  const seen = []
+  const cfg = resolveConfig({ logFile: path.join(tmp(), "plugin.log"), cooldownMs: 0, after: 1, maxRotations: 1, windowMs: 600_000 }, {})
+  const rot = createRotator({ cfg, log: collector(), fetchImpl: fakeProxy({ "/rotate": rotate() }), onState: (s) => seen.push(s) })
+  await rot.onRetry(opencodeRetry())
+  await rot.onRetry(opencodeRetry())
+  assert.equal(seen.at(-1).state, "guard")
+  void h
+})
+
+test("createStateWriter écrit un JSON atomique relisible", () => {
+  const dir = tmp()
+  const file = path.join(dir, "sub", "plugin.state.json")
+  const write = createStateWriter(file)
+  write({ v: 1, state: "ready" })
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { v: 1, state: "ready" })
+  assert.deepEqual(fs.readdirSync(path.dirname(file)), ["plugin.state.json"], "pas de .tmp résiduel")
+  createStateWriter("")({ ignored: true }) // fichier vide => no-op, sans exception
 })

@@ -641,6 +641,7 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
 class SigtermTests(unittest.TestCase):
     """Arrêt propre sur SIGTERM (vrai sous-processus, vrai signal)."""
 
+    @unittest.skipIf(sys.platform == "win32", "SIGTERM POSIX indisponible sous Windows")
     def test_sigterm_arret_propre_et_pidfile_retire(self):
         with tempfile.TemporaryDirectory() as tmp:
             pidfile = Path(tmp) / "proxy.pid"
@@ -714,11 +715,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(c.control_port, 3333)
         self.assertEqual(c.domains, ("opencode.ai", "zen.example.com"))
         self.assertTrue(c.verbose)
-        self.assertEqual(str(c.pidfile), "/tmp/x.pid")
+        self.assertEqual(Path(c.pidfile).as_posix(), "/tmp/x.pid")  # séparateurs : Windows
         self.assertEqual(c.max_tunnels, 3)
         self.assertEqual(c.idle_timeout, 12.0)
         self.assertEqual(c.ip_echo, "")
-        self.assertEqual(str(c.token_file), "/tmp/tok")
+        self.assertEqual(Path(c.token_file).as_posix(), "/tmp/tok")
 
     def test_flags_prioritaires_sur_env(self):
         c = tp.parse_args(

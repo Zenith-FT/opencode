@@ -134,11 +134,15 @@ if not isinstance(cfg, dict):
     print(f"config inattendue (pas un objet) : {best}", file=sys.stderr)
     sys.exit(1)
 entry = {"package": pkg, "options": {"proxyUrl": "http://127.0.0.1:9253"}}
+# OpenCode 2 : `plugins` est un TABLEAU d'éléments texte ou {package, options} (doc officielle,
+# opencode.ai/v2/docs/plugins). La forme objet {"tor-rotate": {...}} est IGNORÉE EN SILENCE.
 plugs = cfg.get("plugins", None)
 if plugs is None:
-    cfg["plugins"] = {"tor-rotate": entry}
+    cfg["plugins"] = [entry]
 elif isinstance(plugs, dict):
-    plugs["tor-rotate"] = entry  # idempotent : même clé, pas de doublon
+    # Ancienne forme objet (v2.1 / v2.2) : convertie en tableau, nos entrées remplacées, le reste gardé.
+    cfg["plugins"] = [v for k, v in plugs.items()
+                      if k != "tor-rotate" and isinstance(v, (str, dict))] + [entry]
 elif isinstance(plugs, list):
     # Forme liste (ancien format) : on remplace nos vieilles entrées, on garde le reste.
     kept = [e for e in plugs

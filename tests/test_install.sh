@@ -47,13 +47,16 @@ grep -q "alias opencode-tor=" "$HOME/.bashrc" 2>/dev/null && ok "install : alias
 if python3 - "$HOME/.config/opencode/opencode.json" <<'PY'; then
 import json, sys
 cfg = json.load(open(sys.argv[1]))
-e = cfg["plugins"]["tor-rotate"]
+assert isinstance(cfg["plugins"], list), cfg   # la V2 ignore la forme objet
+es = [e for e in cfg["plugins"] if isinstance(e, dict)]
+assert len(es) == 1, cfg
+e = es[0]
 assert e["package"].endswith("opencode-tor-rotate/plugin"), e
 assert e["options"]["proxyUrl"] == "http://127.0.0.1:9253", e
 PY
-  ok "install : forme objet {package, options}"
+  ok "install : forme tableau [{package, options}]"
 else
-  ko "install : forme objet {package, options}"
+  ko "install : forme tableau [{package, options}]"
 fi
 [ -f "$HOME/fake-calls.log" ] && ko "install : service non appelé par défaut" || ok "install : service non appelé par défaut"
 
@@ -61,7 +64,7 @@ fi
 cp "$HOME/.config/opencode/opencode.json" "$THOME/once.json"
 bash "$SRC/install.sh" >/dev/null || ko "réinstall : code retour"
 cmp -s "$THOME/once.json" "$HOME/.config/opencode/opencode.json" && ok "idempotence : config inchangée" || ko "idempotence : config inchangée"
-n=$(grep -c '"tor-rotate":' "$HOME/.config/opencode/opencode.json" 2>/dev/null || echo 0); [ "$n" -eq 1 ] && ok "idempotence : pas de doublon" || ko "idempotence : pas de doublon"
+n=$(grep -c '"package":' "$HOME/.config/opencode/opencode.json" 2>/dev/null || echo 0); [ "$n" -eq 1 ] && ok "idempotence : pas de doublon" || ko "idempotence : pas de doublon"
 
 # --- 3. autres clés préservées + migration forme liste ---------------------
 cat > "$HOME/.config/opencode/opencode.json" <<'JSON'
@@ -80,6 +83,27 @@ PY
   ok "migration liste : autre gardé, vieux retiré, objet ajouté"
 else
   ko "migration liste : autre gardé, vieux retiré, objet ajouté"
+fi
+
+# --- 3b. ancienne forme OBJET (v2.1/2.2, ignorée par la V2) -> convertie en tableau -------------
+cat > "$HOME/.config/opencode/opencode.json" <<'JSON'
+{"model": "y", "plugins": {"tor-rotate": {"package": "/old/opencode-tor-rotate/plugin", "options": {"proxyUrl": "http://127.0.0.1:1"}}, "autre": {"package": "/chez/moi/autre"}}}
+JSON
+bash "$SRC/install.sh" >/dev/null || ko "migration objet : code retour"
+if python3 - "$HOME/.config/opencode/opencode.json" <<'PY'; then
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+assert cfg["model"] == "y", cfg
+p = cfg["plugins"]
+assert isinstance(p, list), p
+assert {"package": "/chez/moi/autre"} in p, p
+ours = [e for e in p if isinstance(e, dict) and e.get("package", "").endswith("opencode-tor-rotate/plugin")]
+assert len(ours) == 1 and ours[0]["options"]["proxyUrl"] == "http://127.0.0.1:9253", p
+assert not any(isinstance(e, dict) and e.get("package") == "/old/opencode-tor-rotate/plugin" for e in p), p
+PY
+  ok "migration objet : converti en tableau, autre gardé, ancien remplacé"
+else
+  ko "migration objet : converti en tableau, autre gardé, ancien remplacé"
 fi
 
 # --- 4. migration de l'état -------------------------------------------------

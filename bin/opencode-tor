@@ -182,6 +182,25 @@ for name in (\"opencode.json\", \"opencode.jsonc\"):
         sys.exit(0 if \"tor-rotate\" in open(p, errors=\"replace\").read() else 1)
 sys.exit(1)
 PY"
+  check "widget TUI installé ($SHARE/plugin/tui.mjs)" "[ -f '$SHARE/plugin/tui.mjs' ]"
+  # Information (jamais KO) : le plugin n'écrit son état qu'une fois OpenCode lancé.
+  local sf="${TOR_ROTATE_STATE_FILE:-$STATE_DIR/plugin.state.json}"
+  python3 - "$sf" <<'PY'
+import json, os, sys, time
+p = sys.argv[1]
+try:
+    st = json.load(open(p))
+except Exception:
+    print("[ii] plugin : pas encore chargé (lance OpenCode, l'état apparaît au démarrage)")
+    sys.exit(0)
+try:
+    os.kill(int(st.get("pid", 0)), 0)
+    vivant = "en cours"
+except Exception:
+    vivant = "ARRÊTÉ (service OpenCode fermé ?)"
+ago = int(time.time() - st.get("stateAt", 0) / 1000)
+print(f"[ii] plugin : {vivant} · état {st.get('state')} · {st.get('rotations')} rotation(s) · IP {st.get('lastExit') or '?'} · il y a {ago}s")
+PY
   if [ "$ko" -eq 0 ]; then msg "tout est en ordre"; else msg "voir les lignes [KO] ci-dessus"; fi
   return "$ko"
 }

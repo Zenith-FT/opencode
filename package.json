@@ -1,6 +1,6 @@
 {
   "name": "opencode-tor-rotate",
-  "version": "2.1.0",
+  "version": "2.5.0",
   "description": "OpenCode 2.x plugin: rotate the Tor circuit when the opencode provider rate-limits",
   "license": "MIT",
   "type": "module",
@@ -17,11 +17,13 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test tests/plugin.test.mjs",
+    "test": "node --test tests/plugin.test.mjs tests/tui-model.test.mjs tests/tor-net.test.mjs tests/quota-reset.test.mjs tests/guard-display.test.mjs",
     "test:py": "python3 -m unittest discover -s tests -p 'test_*.py'",
     "test:install": "bash tests/test_install.sh",
-    "check": "node --check plugin/index.js && python3 -m py_compile proxy/tor-split-proxy.py",
-    "lint": "npm run check"
+    "check": "node --check plugin/index.js && node --check plugin/tui-model.js && python3 -m py_compile proxy/tor-split-proxy.py",
+    "lint": "npm run check",
+    "build:tui": "bun scripts/build-tui.ts",
+    "test:tui": "bun test tests/tui.render.test.ts"
   },
   "engines": {
     "node": ">=20"
@@ -31,5 +33,11 @@
     "opencode-plugin",
     "tor",
     "rate-limit"
-  ]
+  ],
+  "devDependencies": {
+    "@opentui/core": "^0.3.0",
+    "@opentui/solid": "^0.3.0",
+    "solid-js": "1.9.12",
+    "bun": "^1.4.0"
+  }
 }
