@@ -1,12 +1,12 @@
 # opencode-tor-rotate
 
-Tu utilises les modèles gratuits d'OpenCode (le canal Zen) et tu tombes sur
-`Rate limit exceeded` en pleine journée ? Ce plugin change ton IP de sortie
+Les modèles gratuits d'OpenCode (le canal Zen) te coupent avec
+`Rate limit exceeded` en pleine journée. Ce plugin change ton IP de sortie
 via Tor quand le quota est épuisé, et OpenCode retente ta requête. Seul le
 trafic vers `opencode.ai` passe par Tor. Tout le reste va en direct.
 
 Le quota gratuit se compte **par IP et par jour** (remise à zéro à 00:00 UTC).
-Changer d'IP te rend un compteur neuf tout de suite.
+Changer d'IP te rend un compteur neuf.
 
 ## Démarrage en 2 minutes
 
@@ -43,7 +43,7 @@ function ot { & "C:\Users\Toi\Tools\opencode-tor-rotate\bin\opencode-tor.ps1" @a
 ]
 ```
 5. Redémarre le service d'arrière-plan une fois (`opencode2 service restart`),
-   puis lance `opencode2` normalement et vérifie avec `ot status`.
+   puis lance `opencode2` et vérifie avec `ot status`.
 
 Détails et pièges Windows : [docs/windows.md](docs/windows.md).
 
@@ -61,8 +61,8 @@ Le plugin ajoute un indicateur dans OpenCode :
 
 Couleurs : `●` vert (prêt), `●` jaune (quota épuisé), `◐` (rotation en cours),
 `●` rouge (Tor hors ligne ou garde-fou atteint), `○` rouge (plugin non chargé).
-Si le widget ne charge pas, un toast rouge explique pourquoi. Tu peux aussi
-ouvrir `ctrl+p` → **Open plugin manager dialog**.
+Si le widget ne charge pas, un toast rouge donne la raison. Ouvre
+`ctrl+p` → **Open plugin manager dialog** pour vérifier.
 
 Preuve que le trafic passe par Tor : cherche `CONNECT opencode.ai:443 -> TOR`
 dans le journal du proxy (`~/.local/state/opencode-tor-rotate/proxy.log`,
@@ -72,7 +72,7 @@ Tu vois cette ligne après ton premier message dans OpenCode.
 ## Comment ça marche
 
 1. OpenCode reçoit une erreur 429 du fournisseur `opencode`. La première erreur
-   ne fait rien : elle passe souvent en retentant.
+   ne fait rien : OpenCode retente tout seul.
 2. À la **deuxième erreur d'affilée**, le plugin demande un nouveau circuit Tor
    au proxy local (port 9253), attend 1,5 seconde et laisse OpenCode retenter.
 3. Dès qu'une requête réussit, le compteur repart à zéro.
@@ -86,7 +86,7 @@ surcharge ne font rien) ; **seul `opencode.ai` passe par Tor**.
 ```bash
 opencode-tor start    # démarre tor (si besoin) + proxy
 opencode-tor status   # état : epoch, tunnels, IP de sortie
-opencode-tor rotate   # change d'IP tout de suite
+opencode-tor rotate   # change d'IP sur demande
 opencode-tor stop     # arrête le proxy proprement
 opencode-tor logs [proxy|tor]
 opencode-tor doctor   # un contrôle par ligne
@@ -102,13 +102,13 @@ Voir [docs/config.md](docs/config.md) pour la liste complète.
 
 ## Dépannage
 
-- **`Connection refused` sur 127.0.0.1:9253.** Le proxy est arrêté :
+- **`Connection refused` sur 127.0.0.1:9253.** Le proxy ne tourne pas :
   `opencode-tor start` (ou `ot start` sous Windows), puis `status`.
-- **OpenCode ignore le proxy.** Le service a démarré sans les variables
+- **OpenCode ignore le proxy.** Tu as démarré le service sans les variables
   d'environnement : `./install.sh --service-env` (confirmation `OUI`), puis
   redémarre le service. Vérifie avec `opencode-tor doctor`.
 - **`opencode` ne semble pas passer par Tor.** Un alias peut masquer le
-  binaire : `command opencode --version` montre ce qui s'exécute vraiment.
+  binaire : `command opencode --version` montre ce qui s'exécute.
 - **Certificats invalides / TLS cassé.** Un antivirus ou un outil d'inspection
   TLS casse les tunnels : désactive la capture pour `opencode.ai`.
 - **Ne laisse jamais un agent OpenCode arrêter tor, le proxy ou le service.**
@@ -126,7 +126,7 @@ les domaines d'OpenCode passent par Tor.
 
 L'installeur **copie** l'ancien état vers le nouvel emplacement, il ne le
 déplace pas. Pour revenir en arrière : `./uninstall.sh` (ajoute `--purge`
-pour effacer aussi le nouvel état), retire le bloc du plugin de ta config,
+pour effacer le nouvel état), retire le bloc du plugin de ta config,
 recharge ton shell.
 
 ## Développement
@@ -139,9 +139,9 @@ npm run test:install  # installateur (bash, HOME jetable + faux binaires)
 ```
 
 Tests 100 % hors ligne : faux serveur SOCKS, faux port de contrôle, faux
-binaire `opencode`. Le fichier `plugin/tui.mjs` se génère depuis
-`plugin/tui.tsx` (`npm i && npm run build:tui`).
+binaire `opencode`. Tu génères `plugin/tui.mjs` depuis `plugin/tui.tsx`
+(`npm i && npm run build:tui`).
 
 Pistes : rotation préventive avant les gros lots de requêtes.
 
-Licence MIT — voir [LICENSE](LICENSE). Changelog : [CHANGELOG.md](CHANGELOG.md).
+Licence MIT : voir [LICENSE](LICENSE). Changelog : [CHANGELOG.md](CHANGELOG.md).
