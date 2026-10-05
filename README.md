@@ -5,6 +5,34 @@ Plugin OpenCode 2.x + proxy local : quand le fournisseur `opencode` répond
 puis fait retenter la requête. Seul `opencode.ai` passe par Tor, le reste va
 en direct.
 
+## Démarrage en 2 minutes
+
+Tu as besoin d'OpenCode 2.x, `tor` et `python3` sur ton PATH.
+
+**Linux / Termux :**
+
+```bash
+git clone https://github.com/Zenith-FT/opencode.git ~/projects/opencode-tor-rotate
+cd ~/projects/opencode-tor-rotate
+./install.sh --alias
+source ~/.bashrc
+opencode-tor start
+opencode-tor status
+```
+
+L'installeur déclare le plugin dans ta config globale, sans toucher au reste.
+Prévisualise avec `./install.sh --dry-run` si tu préfères voir avant.
+
+**Windows (PowerShell) :** suis [docs/windows.md](docs/windows.md). Tu clones le
+dépôt, tu débloques `bin\opencode-tor.ps1` (`Unblock-File`), tu ajoutes les
+fonctions `opencode2` / `ot` à ton profil, tu déclares le plugin dans
+`%USERPROFILE%\.config\opencode\opencode.jsonc`, puis tu tapes `opencode2`.
+
+**Vérifie que ça passe par Tor :** cherche `CONNECT opencode.ai:443 -> TOR`
+dans `~/.local/state/opencode-tor-rotate/proxy.log`
+(`%USERPROFILE%\.local\state\opencode-tor-rotate\proxy.log` sous Windows).
+Tu la vois après ton premier message dans OpenCode.
+
 ## Installation
 
 ```bash
