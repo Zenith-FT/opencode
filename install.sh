@@ -35,7 +35,8 @@ say() { printf '%s\n' "$*"; }
 run() { if [ "$DRY" -eq 1 ]; then printf '[dry-run] %s\n' "$*"; else eval "$*"; fi; }
 backup() { # backup <fichier> : copie horodatée avant modification
   [ -e "$1" ] || return 0
-  local b="$1.bak.$(date +%Y%m%d-%H%M%S)"
+  local b
+  b="$1.bak.$(date +%Y%m%d-%H%M%S)"
   say "sauvegarde : $1 -> $b"
   run "cp -a '$1' '$b'"
 }
